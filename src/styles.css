@@ -2773,7 +2773,8 @@ select:disabled {
 .image-preview-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 38;
+  /* 高于素材库排序菜单(90)、侧栏菜单(60)与首次引导(100)，保证预览时内容始终在顶层。 */
+  z-index: 120;
   display: block;
   padding: 0;
   background: rgba(10, 12, 12, 0.96);

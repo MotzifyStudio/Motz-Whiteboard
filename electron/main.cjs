@@ -1,5 +1,5 @@
-const { app, BrowserWindow, Menu, ipcMain, shell, screen, dialog, nativeImage, clipboard } = require("electron");
-const { execFileSync } = require("node:child_process");
+const { app, BrowserWindow, Menu, ipcMain, shell, screen, dialog, nativeImage, clipboard, protocol } = require("electron");
+const { execFile, execFileSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -30,6 +30,16 @@ let installedFontFamiliesCache = null;
 
 app.setName("MOTZ白板");
 app.setPath("userData", process.env.MOTZ_USER_DATA_DIR || path.join(app.getPath("appData"), "MOTZ白板"));
+
+// The renderer is served over HTTP while developing, so Chromium refuses direct
+// file:// subresources. A dedicated protocol keeps referenced files usable in
+// both development and packaged builds without disabling web security.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "motz-media",
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
+]);
 
 function installedFontFamilies() {
   if (installedFontFamiliesCache) return installedFontFamiliesCache;
@@ -175,6 +185,85 @@ function normalizeFileCheckPath(value) {
     }
   }
   return text;
+}
+
+function mediaUrlForPath(filePath) {
+  const normalizedPath = normalizeFileCheckPath(filePath);
+  if (!normalizedPath) return "";
+  return `motz-media://local/${Buffer.from(path.resolve(normalizedPath), "utf8").toString("base64url")}`;
+}
+
+function mediaPathFromUrl(requestUrl) {
+  try {
+    const url = new URL(requestUrl);
+    if (url.protocol !== "motz-media:" || url.hostname !== "local") return "";
+    const token = url.pathname.replace(/^\/+/, "");
+    const filePath = Buffer.from(token, "base64url").toString("utf8");
+    const resolvedPath = path.resolve(filePath);
+    return mediaExtensions.has(path.extname(resolvedPath).toLowerCase()) && fs.existsSync(resolvedPath) ? resolvedPath : "";
+  } catch {
+    return "";
+  }
+}
+
+// Electron 只能写自定义格式，写不出标准的 CF_HDROP（RegisterClipboardFormat("CF_HDROP")
+// 拿到的是另一个 id），所以单选视频时借 PowerShell 把整份文件写进系统剪贴板。
+function powerShellStringLiteral(value) {
+  return `'${String(value ?? "").replace(/'/g, "''")}'`;
+}
+
+function writeWindowsFileClipboard(filePath, text = "") {
+  return new Promise((resolve) => {
+    const script = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "$data = New-Object System.Windows.Forms.DataObject",
+      "$files = New-Object System.Collections.Specialized.StringCollection",
+      `$files.Add(${powerShellStringLiteral(filePath)})`,
+      "$data.SetFileDropList($files)",
+      ...(text ? [`$data.SetText(${powerShellStringLiteral(text)})`] : []),
+      "[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)",
+    ].join("; ");
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+      { windowsHide: true, timeout: 10000 },
+      (error) => resolve(!error),
+    );
+  });
+}
+
+// 单选本地视频：剪贴板里放整份视频文件，其他应用粘贴得到的就是视频本身。
+async function writeBoardFileClipboard(payload) {
+  const filePath = normalizeFileCheckPath(payload?.filePath);
+  const serialized = typeof payload?.serialized === "string" ? payload.serialized : "";
+  if (!filePath || !fs.existsSync(filePath)) return false;
+  if (process.platform !== "win32") return false;
+  return writeWindowsFileClipboard(filePath, serialized ? `${boardClipboardPrefix}${serialized}` : "");
+}
+
+function writeBoardClipboardPayload(payload) {
+  try {
+    const serialized = typeof payload?.serialized === "string" ? payload.serialized : "";
+    if (!serialized) return false;
+
+    const clipboardPayload = { text: `${boardClipboardPrefix}${serialized}` };
+    const imageBytes = payload?.imageBytes;
+    const buffer = imageBytes ? Buffer.from(imageBytes) : null;
+    if (buffer?.length) {
+      const decoded = nativeImage.createFromBuffer(buffer);
+      if (!decoded.isEmpty()) clipboardPayload.image = decoded;
+    } else {
+      const imagePath = normalizeFileCheckPath(payload?.imagePath);
+      if (imagePath && fs.existsSync(imagePath) && isImagePath(imagePath)) {
+        const image = nativeImage.createFromPath(imagePath);
+        if (!image.isEmpty()) clipboardPayload.image = image;
+      }
+    }
+    clipboard.write(clipboardPayload);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sanitizePathPart(value) {
@@ -1587,6 +1676,10 @@ app.whenReady().then(() => {
     }
     return;
   }
+  protocol.registerFileProtocol("motz-media", (request, callback) => {
+    const filePath = mediaPathFromUrl(request.url);
+    callback(filePath ? { path: filePath } : { error: -6 });
+  });
   Menu.setApplicationMenu(null);
   startPluginBridgeServer();
   ipcMain.on("renderer-ready", (event) => {
@@ -1660,6 +1753,7 @@ app.whenReady().then(() => {
     fs.mkdirSync(libraryRoot, { recursive: true });
     return libraryRoot;
   });
+  ipcMain.handle("get-media-url", (_event, filePath) => mediaUrlForPath(filePath));
   ipcMain.handle("activate-library", (_event, library = {}) => {
     return activateLibraryRoot(library);
   });
@@ -1897,25 +1991,11 @@ app.whenReady().then(() => {
     }
   });
   ipcMain.on("write-board-clipboard", (event, payload) => {
-    try {
-      const serialized = typeof payload?.serialized === "string" ? payload.serialized : "";
-      if (!serialized) {
-        event.returnValue = false;
-        return;
-      }
-
-      const clipboardPayload = { text: `${boardClipboardPrefix}${serialized}` };
-      const imagePath = normalizeFileCheckPath(payload?.imagePath);
-      if (imagePath && fs.existsSync(imagePath) && isImagePath(imagePath)) {
-        const image = nativeImage.createFromPath(imagePath);
-        if (!image.isEmpty()) clipboardPayload.image = image;
-      }
-      clipboard.write(clipboardPayload);
-      event.returnValue = true;
-    } catch {
-      event.returnValue = false;
-    }
+    event.returnValue = writeBoardClipboardPayload(payload);
   });
+  // 多选复制出来的拼图由渲染进程合成，PNG 字节走异步通道避免阻塞渲染进程。
+  ipcMain.handle("write-board-clipboard-image", (_event, payload) => writeBoardClipboardPayload(payload));
+  ipcMain.handle("write-board-clipboard-file", (_event, payload) => writeBoardFileClipboard(payload));
   ipcMain.handle("check-media-paths", (_event, filePaths) => {
     const uniquePaths = Array.from(new Set(Array.isArray(filePaths) ? filePaths : []));
     return Object.fromEntries(
